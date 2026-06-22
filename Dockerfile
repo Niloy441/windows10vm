@@ -2,9 +2,9 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
     qemu-system-x86 \
+    qemu-kvm \
     qemu-utils \
     novnc \
     websockify \
@@ -13,88 +13,102 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     net-tools \
     unzip \
     python3 \
+    aria2 \
     && rm -rf /var/lib/apt/lists/*
-
 
 RUN mkdir -p /data /iso /novnc
 
-
-RUN wget https://github.com/novnc/noVNC/archive/refs/heads/master.zip -O /tmp/novnc.zip && \
+RUN wget -q https://github.com/novnc/noVNC/archive/refs/heads/master.zip -O /tmp/novnc.zip && \
     unzip /tmp/novnc.zip -d /tmp && \
     mv /tmp/noVNC-master/* /novnc && \
-    rm -rf /tmp/novnc.zip /tmp/noVNC-master
+    rm -rf /tmp/novnc.zip /tmp/noVNC-master && \
+    ln -sf /novnc/vnc.html /novnc/index.html
 
+RUN cat > /start.sh << 'EOF'
+#!/bin/bash
+set -e
 
-ENV ISO_URL="https://archive.org/download/windows-10-lite-edition-19h2-x64/Windows%2010%20Lite%20Edition%2019H2%20x64.iso"
+# KVM check
+if [ -e /dev/kvm ]; then
+  echo "✅ KVM available"
+  KVM_ARG="-enable-kvm"
+  CPU_ARG="host"
+  MEMORY="3G"
+  SMP_CORES=2
+else
+  echo "⚠️ KVM not available - slow mode"
+  KVM_ARG=""
+  CPU_ARG="qemu64"
+  MEMORY="2G"
+  SMP_CORES=1
+fi
 
+# ISO download
+ISO_FILE="/iso/os.iso"
+if [ ! -f "$ISO_FILE" ]; then
+  echo "📥 Downloading Tiny10 ISO..."
+  aria2c -x 8 -s 8 --dir=/iso --out=os.iso \
+    "https://archive.org/download/tiny-10-23-h2/tiny10%20x64%2023h2.iso"
+  echo "✅ ISO downloaded"
+fi
 
-RUN echo '#!/bin/bash\n\
-set -e\n\
-\n\
-# Check for KVM support\n\
-if [ -e /dev/kvm ]; then\n\
-  echo "✅ KVM acceleration available"\n\
-  KVM_ARG="-enable-kvm"\n\
-  CPU_ARG="host"\n\
-  MEMORY="16G"\n\
-  SMP_CORES=4\n\
-else\n\
-  echo "⚠️  KVM not available - using slower emulation mode"\n\
-  KVM_ARG=""\n\
-  CPU_ARG="qemu64"\n\
-  MEMORY="2G"\n\
-  SMP_CORES=1\n\
-fi\n\
-\n\
-# Download ISO if needed\n\
-if [ ! -f "/iso/os.iso" ]; then\n\
-  echo "📥 Downloading Windows 10 ISO..."\n\
-  wget -q --show-progress "$ISO_URL" -O "/iso/os.iso"\n\
-fi\n\
-\n\
-# Create disk image if not exists\n\
-if [ ! -f "/data/disk.qcow2" ]; then\n\
-  echo "💽 Creating 100GB virtual disk..."\n\
-  qemu-img create -f qcow2 "/data/disk.qcow2" 100G\n\
-fi\n\
-\n\
-# Windows-specific boot parameters\n\
-BOOT_ORDER="-boot order=c,menu=on"\n\
-if [ ! -s "/data/disk.qcow2" ] || [ $(stat -c%s "/data/disk.qcow2") -lt 1048576 ]; then\n\
-  echo "🚀 First boot - installing Windows from ISO"\n\
-  BOOT_ORDER="-boot order=d,menu=on"\n\
-fi\n\
-\n\
-echo "⚙️ Starting Windows 10 VM with ${SMP_CORES} CPU cores and ${MEMORY} RAM"\n\
-\n\
-# Start QEMU with Windows-optimized settings\n\
-qemu-system-x86_64 \\\n\
-  $KVM_ARG \\\n\
-  -machine q35,accel=kvm:tcg \\\n\
-  -cpu $CPU_ARG \\\n\
-  -m $MEMORY \\\n\
-  -smp $SMP_CORES \\\n\
-  -vga std \\\n\
-  -usb -device usb-tablet \\\n\
-  $BOOT_ORDER \\\n\
-  -drive file=/data/disk.qcow2,format=qcow2 \\\n\
-  -drive file=/iso/os.iso,media=cdrom \\\n\
-  -netdev user,id=net0,hostfwd=tcp::3389-:3389 \\\n\
-  -device e1000,netdev=net0 \\\n\
-  -display vnc=:0 \\\n\
-  -name "Windows10_VM" &\n\
-\n\
-# Start noVNC\n\
-sleep 5\n\
-websockify --web /novnc 6080 localhost:5900 &\n\
-\n\
-echo "===================================================="\n\
-echo "🌐 Connect via VNC: http://localhost:6080"\n\
-echo "🔌 After install, use RDP: localhost:3389"\n\
-echo "❗ First boot may take 20-30 minutes for Windows install"\n\
-echo "===================================================="\n\
-\n\
-tail -f /dev/null\n' > /start.sh && chmod +x /start.sh
+# Disk create
+if [ ! -f "/data/disk.qcow2" ]; then
+  echo "💽 Creating 40GB virtual disk..."
+  qemu-img create -f qcow2 /data/disk.qcow2 40G
+fi
+
+# Boot order
+DISK_SIZE=$(stat -c%s /data/disk.qcow2 2>/dev/null || echo 0)
+if [ "$DISK_SIZE" -lt 10485760 ]; then
+  echo "🚀 First boot - booting from ISO"
+  BOOT_ORDER="-boot order=d,menu=on"
+else
+  echo "🔄 Booting from disk"
+  BOOT_ORDER="-boot order=c,menu=on"
+fi
+
+echo "⚙️ Starting VM with ${SMP_CORES} cores and ${MEMORY} RAM..."
+
+# Start QEMU
+qemu-system-x86_64 \
+  $KVM_ARG \
+  -machine q35 \
+  -cpu $CPU_ARG \
+  -m $MEMORY \
+  -smp $SMP_CORES \
+  -vga std \
+  -usb -device usb-tablet \
+  $BOOT_ORDER \
+  -drive file=/data/disk.qcow2,format=qcow2,if=virtio \
+  -drive file=$ISO_FILE,media=cdrom,readonly=on \
+  -netdev user,id=net0,hostfwd=tcp::3389-:3389 \
+  -device e1000,netdev=net0 \
+  -display vnc=:0 \
+  -name "Windows10_VM" &
+
+QEMU_PID=$!
+echo "✅ QEMU started (PID: $QEMU_PID)"
+
+# Wait for VNC to be ready
+echo "⏳ Waiting for VNC..."
+sleep 8
+
+# Start noVNC
+websockify --web /novnc 6080 localhost:5900 &
+echo "✅ noVNC started"
+
+echo ""
+echo "===================================="
+echo "🌐 noVNC:  http://localhost:6080"
+echo "🖥️  RDP:    localhost:3389"
+echo "⚠️  First install = 20-30 minutes"
+echo "===================================="
+
+wait $QEMU_PID
+EOF
+
+RUN chmod +x /start.sh
 
 VOLUME ["/data", "/iso"]
 EXPOSE 6080 3389
